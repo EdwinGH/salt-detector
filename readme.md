@@ -3,6 +3,8 @@
 Local monitoring for a Think:Water **salt:detector** — a time-of-flight salt
 level sensor for water softener brine tanks.
 
+<img src="https://aquamundas.nl/wp-content/uploads/2024/01/Salt-Detector-Aquamundas-l.r.-1.jpg" width="400" alt="salt:detector">
+
 The manufacturer was acquired by Culligan and the device backend at
 `iot.thinkwater.com:30103` was retired. That hostname now serves a Culligan One
 web dashboard on Azure App Service, which cannot host the raw TCP listener the
@@ -10,8 +12,6 @@ firmware expects; ports 80 and 443 answer, 30103 is silently dropped. Deployed
 units provision over Bluetooth, join wifi, obtain a DHCP lease, then retry TCP
 forever and never finish setup. The vendor app is permanently unusable with
 this hardware revision.
-
-Product specifications: [Think:Water user guide](https://thinkwater.com/en/saltdetector-user-guide/)
 
 This project points the device at a local MQTT broker instead and speaks its
 protocol directly. No cloud, no vendor dependency.
