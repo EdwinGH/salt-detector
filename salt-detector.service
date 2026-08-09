@@ -1,0 +1,20 @@
+[Unit]
+Description=Reading salt:detector ToF salt level to MySQL database
+After=syslog.target network-online.target mysqld.service mosquitto.service
+Requires=mysqld.service
+# When fails, send mail to root
+OnFailure=status-email-user@%n.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/local/bin
+ExecStart=/usr/bin/python3 /usr/local/bin/salt-detector-daemon.py -c /etc/salt-detector.conf
+SyslogIdentifier=saltdetector
+# Send SIGINT instead of SIGTERM, as SIGINT simply fires KeyboardInterrupt exception
+KillSignal=SIGINT
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

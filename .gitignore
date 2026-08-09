@@ -1,0 +1,23 @@
+# real config — holds DB password and device id
+salt-detector.conf
+
+# vendor APK and extracted contents — not ours to redistribute
+APK/
+*.apk
+
+# packet captures — contain network topology
+*.pcap
+*.pcapng
+
+# TLS material
+*.pem
+*.key
+*.crt
+
+# python
+__pycache__/
+*.pyc
+
+# logs and scratch
+*.log
+saltd-*.sh
