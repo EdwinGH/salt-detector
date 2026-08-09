@@ -11,8 +11,7 @@ units provision over Bluetooth, join wifi, obtain a DHCP lease, then retry TCP
 forever and never finish setup. The vendor app is permanently unusable with
 this hardware revision.
 
-Product photos and specifications: [Aquamundas](https://aquamundas.nl/) ·
-[Think:Water user guide](https://thinkwater.com/en/saltdetector-user-guide/)
+Product specifications: [Think:Water user guide](https://thinkwater.com/en/saltdetector-user-guide/)
 
 This project points the device at a local MQTT broker instead and speaks its
 protocol directly. No cloud, no vendor dependency.
