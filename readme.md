@@ -14,6 +14,8 @@ this hardware revision.
 This project points the device at a local MQTT broker instead and speaks its
 protocol directly. No cloud, no vendor dependency.
 
+![architecture](docs/architecture.svg)
+
 ## How it works
 
 The firmware has `iot.thinkwater.com` compiled in, so redirect it with a DNS
