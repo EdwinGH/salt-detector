@@ -81,7 +81,9 @@ The device also subscribes to `device/auto/tinhigh/<id>`,
 `device/update/capacity/<id>`, `device/ota/request/<id>` and
 `device/feedback/<id>`. No payload format has been found for any of them. APK
 analysis (below) shows these were all driven by the vendor backend, not by the
-app, so the formats are not recoverable from the client.
+app, so the formats are not recoverable from the client — and UART analysis
+(further below) shows why no format will ever work on `device/feedback/<id>`
+specifically.
 
 Command payloads on the working topics are **bare scalars**, not JSON — `1` on
 `device/admin/reset/<id>` triggers a real factory reset. The exception is
@@ -99,8 +101,11 @@ reboots the device.
 - Consecutive readings vary by tens of millimetres. Take a median.
 - The device clock **resets to 1970 on every reboot**. Push the time each run.
 - The timestamp topic wants a JSON object. A bare string **reboots the device**.
-- Never publish a **retained** message to `device/feedback/<id>`: the device
-  resubscribes on boot, receives it again immediately, and crash-loops.
+- Never publish a **retained** message to `device/feedback/<id>`, ever,
+  including to clear it: the firmware crashes on any message to that topic
+  (confirmed by UART, see below), and a retained one replays on every
+  reconnect, producing an endless bootloop indistinguishable from a hardware
+  fault.
 - Provisioning never completes without the vendor cloud, so
   `device/provisioning` retries in the background forever. Harmless — commands
   work regardless.
@@ -186,36 +191,166 @@ URL, no `.bin`, and no OTA payload builder in the binary. The app called
 `device/ota/request/<id>` itself. The OTA payload format is not recoverable from
 the app.
 
-## The provisioning reply: unsolved, and why
+## The provisioning reply: root cause found
 
 The device publishes `device/provisioning` every ~60s and waits on
-`device/feedback/<id>`. Without a valid reply it never reaches a provisioned
-state, and the LEDs blink amber/red instead of showing a level. Everything else
-works regardless — commands are answered normally.
+`device/feedback/<id>`. Two weeks of testing from the network side (~45 payload
+shapes, timed replies, field names harvested from the app binary, sequences of
+other topics first) never produced a provisioned state. UART access to the
+module ended the guessing outright.
 
-What was tried, and ruled out:
+**The firmware crashes on any message to `device/feedback/<id>`, unconditionally,
+regardless of payload.** Confirmed from the boot log, captured over the ESP32's
+primary UART (see [UART / serial console access](#uart--serial-console-access)
+below):
 
-| Approach | Result |
-|---|---|
-| ~45 payload shapes on `device/feedback/<id>` | all rejected |
-| Sequences (clock/tinhigh/capacity, then feedback) | all rejected |
-| Sub-millisecond replies timed to the device's own publish | all rejected |
-| Field names harvested from the app binary | all rejected |
-| The app as the replier | APK proves it only subscribes |
-| OTA as a way in | no payload format in the app |
-| A second non-MQTT channel | unfiltered packet capture: none exists |
-| USB serial | power-only, no data lines |
+```
+I (00:02:55.953) MQTT: MQTT_EVENT_DATA
+I (00:02:55.954) MQTT: TOPIC NAME: device/feedback/e0e2-e66c-xxxx
+I (00:02:55.962) MQTT: SUB <--- 1
+Guru Meditation Error: Core  1 panic'ed (LoadProhibited). Exception was unhandled.
+Core 1 register dump:
+PC      : 0x400014fd  PS      : 0x00060830  A0      : 0x800e3212  A1      : 0x3ffec970
+A2      : 0x00000000  A3      : 0xfffffffc  A4      : 0x000000ff  A5      : 0x0000ff00
+...
+EXCVADDR: 0x00000000  LBEG    : 0x400014fd  LEND    : 0x4000150d  LCOUNT  : 0xffffffff
 
-Wrong input on this topic reboots the device, and a reboot is indistinguishable
-from a silent rejection, so there is no gradient to follow. Combined with the
-~60s retry interval, brute force is impractical.
+Backtrace: 0x400014fa:0x3ffec970 0x400e320f:0x3ffec980 0x400d7a17:0x3ffeca10 ...
 
-The schema now exists in only two places: the decommissioned backend, and the
-device's own flash. **Reading it requires UART access to the pads inside the
-case** (3.3 V only). A `strings` dump would answer it in seconds — and at that
-point flashing ESPHome is the better end state anyway, since it removes the
-provisioning state machine entirely.
+Rebooting...
+```
 
+`EXCVADDR: 0x00000000` is a **null-pointer dereference**. The firmware
+dereferences an object through a pointer that only the vendor's now-decommissioned
+backend would ever have initialised — the crash happens before the payload is
+even parsed, which is why nothing tried from the network side could ever have
+found a working reply. Reproduced identically on both CPU cores, on a fully
+empty payload (`SUB <---` with nothing after it), and immediately after a fresh
+BLE re-pairing — same `PC`, same `EXCVADDR`, same backtrace every time.
+
+**A retained message on this topic is a standing bootloop trigger.** Mosquitto
+replays a retained message the instant a client subscribes, so if one is ever
+left on `device/feedback/<id>` (e.g. from an interactive test session that
+included `-r`), the device crashes within about a second of every reconnect —
+forever, indistinguishable from a hardware fault. This is confirmed as the
+actual cause of an unrelated week-long bootloop earlier in this project,
+originally blamed on power or the housing pressing the reset button. Neither
+was it: a stray retained message survived from early testing and replayed on
+every reconnect until it was cleared.
+
+**Consequence: never publish to `device/feedback/<id>` with `-r`, ever,
+including to clear it.** Even an empty retained payload crashes the device the
+instant it's received. If a retained message must be cleared, do it with the
+device powered off, then power it back on only after confirming the topic is
+silent:
+
+```sh
+mosquitto_sub -h 127.0.0.1 -p 1883 -t 'device/feedback/<id>' -v -W 3   # silence = clear
+mosquitto_pub -h 127.0.0.1 -p 1883 -r -t 'device/feedback/<id>' -n     # clears it
+```
+
+`salt-detector-daemon.py` checks and auto-clears this topic on every startup as
+a safety net (see [Known behaviour](#known-behaviour)).
+
+The reply schema itself is now moot — no payload will ever be accepted, because
+the crash fires before parsing. **The LEDs will never show a configured state
+without a firmware patch**, which only Think:Water could supply. This is a
+permanent, confirmed limitation, not an open question.
+
+### What the LEDs mean
+
+Also confirmed from the boot log: `LEDS FUNCTION -> 12` is the firmware's
+unprovisioned / no-tin-capacity display state, printed continuously once the
+device is connected but has no valid vat height:
+
+```
+I (00:01:50.488) TOF: AVERANGE MEASURE -> 27
+W (00:01:50.489) TOF: TIN CAPACITY NOT SETTED
+SALT ERROR 200
+LEDS FUNCTION -> 12
+```
+
+The sensor takes a real reading (27 mm) even in this state — the firmware just
+refuses to compute a level from it, because `tinhigh`/`capacity` were always
+server-side values. This is the permanent state the device will show; it is
+cosmetic and does not affect anything this project reads over MQTT.
+
+A second, unrelated fault appears on every boot regardless of provisioning
+state:
+
+```
+W (00:01:37.779) NVS: Fail to open R/W mode NVS page nvs_data
+W (00:01:37.786) TOF: Invalid pin founded on NVS. Setted XSHUT_TOF_0
+I (00:01:47.042) TOF: Tin capacity from NVS 4294967295
+```
+
+`4294967295` (`0xFFFFFFFF`) is an erased/uninitialised NVS read — the `nvs`
+partition (offset `0x9000`, length `0x4000` per the device's own partition
+table, printed at every boot) isn't opening cleanly. This is a plausible
+contributor to any *other* unexplained reboot behaviour and is safe to clear
+with esptool, since it only holds WiFi/runtime data the firmware rebuilds on
+next boot:
+
+```sh
+esptool.py --port COM5 erase_region 0x9000 0x4000
+```
+
+Do **not** run a full `erase_flash` — that would remove the application
+firmware itself, which cannot be reflashed since no factory image was ever
+released for this hardware generation.
+
+## UART / serial console access
+
+The micro-USB port is power-only (confirmed: no `/dev/ttyUSB*` appears when
+plugged into a PC, and no USB-UART chip is populated on that connector's data
+lines). Console access needs the module's primary UART, exposed as castellated
+pads on the edge of the **ESP32-WROOM-32E** module itself.
+
+### Pins (from the official Espressif WROOM-32E datasheet)
+
+| Pin # | Function | Use |
+|---|---|---|
+| 1 | GND | ground reference |
+| 34 | RXD0 (GPIO3) | device receive — connect to adapter TX (only needed for esptool, not for read-only logging) |
+| 35 | TXD0 (GPIO1) | device transmit — connect to adapter RX |
+| 3 | EN | reset — needed for esptool bootloader entry |
+| 23 | GPIO0 (IO0) | boot-mode strap — needed for esptool bootloader entry |
+
+Pin 1 is marked by a small orientation dot on the module's metal can; pins run
+counter-clockwise around the perimeter from there. A 3.3 V-only USB-serial
+adapter (CP2102/CH340/FTDI) is required — **5 V will damage the chip.**
+
+For a **read-only boot log**, only GND and TXD0 (pin 35) are needed:
+
+```
+adapter GND → module pin 1
+adapter RX  → module pin 35 (TXD0)
+```
+
+Power the board from its own micro-USB as normal, then open a terminal at
+115200 baud (`screen /dev/ttyUSB0 115200`, PuTTY on Windows set to Serial, or
+the Arduino IDE Serial Monitor with baud set to 115200). The reset reason on
+the first line settles most hardware questions immediately:
+
+```
+rst:0x1  (POWERON_RESET)      — normal power-up
+rst:0xc  (SW_CPU_RESET)       — a software restart call (crash handler, or the
+                                 red button — both were observed to produce this
+                                 same code on this unit)
+rst:0x10 (RTCWDT_RTC_RESET)   — watchdog timeout
+Brownout detector was triggered — insufficient supply voltage
+```
+
+For **esptool** (flashing, erasing regions), TXD0 alone isn't enough — wire
+RXD0 (pin 34) as well, and use `EN`/`GPIO0` to force bootloader mode: hold
+`GPIO0` to GND, briefly pulse `EN` to GND and release, then run the esptool
+command within a few seconds.
+
+```sh
+pip install esptool
+esptool.py --port COM5 chip_id          # confirms the connection
+esptool.py --port COM5 erase_region 0x9000 0x4000   # NVS fix, see above
+```
 
 ## Layout
 
@@ -226,7 +361,8 @@ salt-detector-example.conf     config template (JSON5 despite the extension)
 salt-detector.service          systemd unit
 
 salt-detector-capture.sh       unfiltered traffic capture, for diagnosis
-salt-detector-responder.py     replies to provisioning the instant it arrives
+salt-detector-responder.py     MQTT research tool; also: --clear-feedback to
+                               safely clear a retained crash-trigger message
 ```
 
 The last two are research tools, not part of the monitoring. `responder.py`
@@ -335,25 +471,42 @@ Exercise it before trusting it:
 
 ## Known behaviour
 
-- **The LEDs blink amber/red permanently.** The device never completes
-  provisioning without the vendor backend, so it shows an unconfigured state.
-  It is reporting something true. Readings, commands and timekeeping all work
-  normally regardless, and once the unit is in the brine container the lights
-  are under the lid.
+- **The LEDs blink amber/red permanently (`LEDS FUNCTION -> 12`).** Confirmed
+  from the boot log as the firmware's unprovisioned / no-tin-capacity display
+  state. This cannot be changed without a firmware patch — see
+  [The provisioning reply: root cause found](#the-provisioning-reply-root-cause-found).
+  Readings, commands, and timekeeping all work normally regardless, and once
+  the unit is in the brine container the lights are under the lid.
+- **A retained message on `device/feedback/<id>` crash-loops the device
+  forever.** Confirmed by UART: the firmware null-pointer-crashes on any
+  message to that topic, and a retained one replays on every reconnect,
+  producing an apparently hardware-level bootloop. `salt-detector-daemon.py`
+  checks for and auto-clears this on every startup as a safety net — watch for
+  a `WARNING: a retained message is sitting on device/feedback` line in the
+  logs after any manual MQTT testing.
 - **`device/provisioning` republishes every ~60s** forever. Harmless noise on
   the broker.
 - **The device clock resets to 1970 on every reboot.** The daemon pushes the
   time before each measurement cycle.
 - **`level: 0` means no valid target**, not an empty tin. Direct sunlight
   defeats the sensor past roughly 500 mm; inside a closed container this does
-  not arise.
+  not arise. The daemon logs the actual out-of-range value (e.g. `out of
+  range: 0 mm`) rather than just "no valid reading", so a genuine fault is
+  distinguishable from a beam pointed at nothing.
 - **Readings are stable in a good mounting position** — typically 1–3 mm of
   jitter across consecutive samples. Wildly varying or pinned-identical values
   suggest the beam is hitting a slope, a wall, or a dirty lens.
 - **Marginal power causes reboot loops.** The supply is 5 Vdc 0.1 A; a longer
   cable or a substitute adapter can brown out the ESP32 during WiFi transmit,
   which looks like: white LED, beep, flashing red/amber, repeat. Test with the
-  original supply before suspecting software.
+  original supply before suspecting software. Distinguish this from the
+  retained-message bootloop above by checking the UART reset reason: a
+  brownout says so explicitly, whereas the feedback crash shows a Guru
+  Meditation dump with `EXCVADDR: 0x00000000`.
+- **`Fail to open R/W mode NVS page nvs_data` on every boot.** A separate,
+  minor fault — the `nvs` partition (`0x9000`, length `0x4000`) isn't opening
+  cleanly. Fixable with `esptool.py erase_region 0x9000 0x4000`; see
+  [UART / serial console access](#uart--serial-console-access).
 
 ## Maintenance
 

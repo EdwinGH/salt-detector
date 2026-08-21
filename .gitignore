@@ -21,3 +21,4 @@ __pycache__/
 # logs and scratch
 *.log
 saltd-*.sh
+salt-detector-daemon_*.py
