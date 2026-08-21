@@ -25,8 +25,8 @@ Requires paho-mqtt for the low-latency path:
 """
 
 import argparse
-import os
 import json
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -40,7 +40,7 @@ except ImportError:
 
 BROKER = "127.0.0.1"
 PORT = 1883
-DEV = os.environ.get("SALTD_DEV", "xxxx-xxxx-xxxx")
+DEV = "e0e2-e66c-xxxx"
 FEEDBACK = f"device/feedback/{DEV}"
 
 # One candidate per provisioning cycle. Scalars first: commands on this device
@@ -115,8 +115,12 @@ class Responder:
 
             cand = self.candidates[self.idx]
             self.idx += 1
-            # fire immediately — the whole point of this script
-            client.publish(FEEDBACK, cand, qos=0)
+            # fire immediately — the whole point of this script.
+            # retain is explicit and MUST stay False: a retained message on
+            # this topic crash-loops the device forever on every reconnect
+            # (confirmed by UART boot log — see readme.md). Never add -r /
+            # retain=True to anything published here.
+            client.publish(FEEDBACK, cand, qos=0, retain=False)
             self.last_sent = cand
             self.last_sent_at = time.monotonic()
             log(f"    <- [{self.idx}/{len(self.candidates)}] {cand}")
@@ -133,9 +137,31 @@ def main():
     ap.add_argument("--listen", action="store_true",
                     help="observe provisioning timing without replying")
     ap.add_argument("--payload", help="send this one payload every cycle")
+    ap.add_argument("--clear-feedback", action="store_true",
+                    help="clear a retained message on device/feedback and exit. "
+                         "POWER OFF THE DEVICE FIRST — see warning printed.")
     ap.add_argument("--host", default=BROKER)
     ap.add_argument("--port", type=int, default=PORT)
     args = ap.parse_args()
+
+    if args.clear_feedback:
+        print("Clearing any retained message on", FEEDBACK)
+        print("If the device is powered on and subscribed, it will receive")
+        print("this clear as a message too and MAY crash-loop briefly before")
+        print("the topic settles. Power the device off first if possible,")
+        print("clear, then power it back on.")
+        subprocess.run(["mosquitto_pub", "-h", args.host, "-p", str(args.port),
+                        "-r", "-t", FEEDBACK, "-n"], check=False)
+        check = subprocess.run(
+            ["mosquitto_sub", "-h", args.host, "-p", str(args.port),
+             "-t", FEEDBACK, "-C", "1", "-W", "3"],
+            capture_output=True, text=True,
+        )
+        if check.stdout.strip():
+            print("still present:", check.stdout.strip())
+            return 1
+        print("confirmed clear.")
+        return 0
 
     cands = [args.payload] * 20 if args.payload else CANDIDATES
     r = Responder(cands, listen_only=args.listen)
@@ -169,4 +195,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

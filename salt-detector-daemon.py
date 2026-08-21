@@ -195,6 +195,37 @@ class Device:
             log(f"unparseable reply: {out[:120]}")
             return None
 
+    def check_retained_feedback(self):
+        """
+        True if a retained message is sitting on device/feedback/<id>.
+
+        This topic crashes the firmware on ANY message, retained or not,
+        payload or none (confirmed: firmware null-pointer-dereferences in its
+        MQTT_EVENT_DATA handler for this topic, unconditionally). A retained
+        message here means the device crash-loops forever on every
+        reconnect, since mosquitto replays it the instant the device
+        subscribes. See readme.md for the full writeup.
+        """
+        topic = f"device/feedback/{self.device_id}"
+        try:
+            result = subprocess.run(
+                ["mosquitto_sub", "-h", self.host, "-p", str(self.port),
+                 *self._auth(), "-t", topic, "-C", "1", "-W", "2"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return bool(result.stdout.strip())
+        except Exception:
+            return False
+
+    def clear_retained_feedback(self):
+        """Clear a retained message on device/feedback/<id>, if any."""
+        topic = f"device/feedback/{self.device_id}"
+        subprocess.run(
+            ["mosquitto_pub", "-h", self.host, "-p", str(self.port),
+             *self._auth(), "-r", "-t", topic, "-n"],
+            check=False, capture_output=True,
+        )
+
     def set_clock(self):
         """The device clock resets to 1970 on reboot; push the real time."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -214,12 +245,16 @@ class Device:
         reply = self.request(f"device/update/telemetry/{self.device_id}", "1",
                              "device/telemetry")
         if not reply:
+            log("  no reply from device")
             return None
         mm = reply.get("level")
         if not isinstance(mm, (int, float)):
+            log(f"  reply had no usable 'level' field: {reply}")
             return None
         mm = int(mm)
         if mm < self.min_mm or mm > self.max_mm:
+            log(f"  out of range: {mm} mm (valid window is "
+                f"{self.min_mm}-{self.max_mm} mm)")
             return None
         return mm
 
@@ -373,6 +408,17 @@ def loop(cfg, dev):
     log(f"daemon starting: device={dev.device_id} "
         f"broker={dev.host}:{dev.port} interval={interval}s")
     log(f"calibration: full={dev.full_mm}mm empty={dev.empty_mm}mm")
+
+    if dev.check_retained_feedback():
+        log("WARNING: a retained message is sitting on device/feedback — "
+            "this crash-loops the device on every reconnect. Clearing it.")
+        dev.clear_retained_feedback()
+        if dev.check_retained_feedback():
+            log("WARNING: retained message still present after clearing — "
+                "check manually: mosquitto_sub -t device/feedback/"
+                f"{dev.device_id} -v -W 3")
+        else:
+            log("cleared. if the device was crash-looping, power-cycle it now.")
 
     if delay and not _stop:
         log(f"waiting {delay}s for the network to settle")
