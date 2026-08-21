@@ -22,6 +22,7 @@ import argparse
 import json
 import re
 import smtplib
+import socket
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -265,14 +266,165 @@ readings. Soft dry cloth, no liquids or sprays.
 """
 
 
+# -------------------------------------------------------------- diagnostics --
+#
+# Run only when a reading is stale. Read-only, best-effort: every check is
+# wrapped so a permission error or missing tool degrades to a note in the
+# output rather than crashing the alert. Nothing here talks to the device
+# itself — this diagnoses the monitoring, not the salt.
+
+def check_broker_reachable(cfg, timeout=3):
+    """Plain TCP connect to the local plaintext listener. No MQTT handshake,
+    no side effects — just answers "is anything listening at all?"."""
+    host = cfg["mqtt"]["host"]
+    port = int(cfg["mqtt"]["port"])
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, f"{host}:{port} accepts connections"
+    except OSError as exc:
+        return False, f"{host}:{port} refused/unreachable: {exc}"
+
+
+def service_status(name):
+    try:
+        r = subprocess.run(["systemctl", "is-active", name],
+                           capture_output=True, text=True, timeout=5)
+        state = (r.stdout or r.stderr or "unknown").strip()
+        state = state.splitlines()[0] if state else "unknown"
+        return state
+    except Exception as exc:
+        return f"unknown ({exc})"
+
+
+def journal_lines(unit, hours):
+    """Best-effort journalctl read. Returns (lines, error_note)."""
+    try:
+        r = subprocess.run(
+            ["journalctl", "-u", unit, "--since", f"{hours} hours ago",
+             "--no-pager"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0 and not r.stdout:
+            return [], (r.stderr or "journalctl returned no output — "
+                       "permission denied, or the unit name is wrong?")
+        return r.stdout.splitlines(), None
+    except FileNotFoundError:
+        return [], "journalctl not found"
+    except Exception as exc:
+        return [], str(exc)
+
+
+def daemon_journal_summary(unit, hours):
+    """Count the recognisable outcome lines the daemon logs each cycle."""
+    lines, err = journal_lines(unit, hours)
+    if err:
+        return None, err
+    patterns = [
+        ("stored (successful reading)", "  stored"),
+        ("no reply from device", "no reply from device"),
+        ("out-of-range reading", "out of range:"),
+        ("reply missing 'level' field", "reply had no usable 'level' field"),
+        ("database write failed", "database write failed"),
+        ("retained-feedback warning (auto-cleared)",
+         "retained message is sitting on device/feedback"),
+    ]
+    counts = {label: sum(1 for l in lines if needle in l)
+             for label, needle in patterns}
+    return counts, None
+
+
+def device_seen_on_broker(cfg, mosquitto_unit, hours):
+    """
+    Has the device (re)connected to mosquitto recently? Matched on the last
+    hex group of the device id (e.g. 'bd34' from 'e0e2-e66c-bd34') rather
+    than an exact client-id string, since the firmware's client id casing is
+    inconsistent (observed as e.g. 'ESP32_6cBD34').
+    """
+    lines, err = journal_lines(mosquitto_unit, hours)
+    if err:
+        return None, None, err
+    tail = cfg["mqtt"]["device_id"].split("-")[-1].lower()
+    connects = [l for l in lines
+               if "new client connected" in l.lower() and tail in l.lower()]
+    return len(connects) > 0, len(connects), None
+
+
+def ping_device(ip, count=3, timeout=2):
+    """Optional: only runs if diagnostics.device_ip is set in the config."""
+    try:
+        r = subprocess.run(
+            ["ping", "-c", str(count), "-W", str(timeout), ip],
+            capture_output=True, text=True, timeout=count * timeout + 5,
+        )
+        m = re.search(r"(\d+)% packet loss", r.stdout)
+        loss = m.group(1) + "%" if m else "unknown"
+        return loss, r.stdout
+    except Exception as exc:
+        return None, str(exc)
+
+
+def diagnose_stale(cfg, hours):
+    """Assemble a human-readable diagnostic report for a stale reading."""
+    d = cfg.get("diagnostics", {})
+    daemon_unit = d.get("daemon_service", "salt-detector")
+    broker_unit = d.get("broker_service", "mosquitto")
+    device_ip = d.get("device_ip")
+
+    lines = []
+
+    reachable, detail = check_broker_reachable(cfg)
+    lines.append(f"Broker ({daemon_unit}'s MQTT host)   : "
+                f"{'reachable' if reachable else 'UNREACHABLE'} — {detail}")
+
+    state = service_status(daemon_unit)
+    flag = "" if state == "active" else "  <-- not running"
+    lines.append(f"Daemon service ({daemon_unit})        : {state}{flag}")
+
+    seen, n, err = device_seen_on_broker(cfg, broker_unit, hours)
+    if err:
+        lines.append(f"Device seen on broker (last {hours}h)  : unknown — {err}")
+    elif seen:
+        loop_flag = "  <-- reconnecting repeatedly, possible bootloop" if n > 5 else ""
+        lines.append(f"Device seen on broker (last {hours}h)  : "
+                    f"yes, {n} connection(s){loop_flag}")
+    else:
+        lines.append(f"Device seen on broker (last {hours}h)  : "
+                    f"NO — device has not reconnected at all")
+
+    counts, err = daemon_journal_summary(daemon_unit, hours)
+    if err:
+        lines.append(f"\nDaemon log summary (last {hours}h): unavailable — {err}")
+    else:
+        lines.append(f"\nDaemon log summary (last {hours}h):")
+        for label, n in counts.items():
+            if n:
+                lines.append(f"  {n:>3}  {label}")
+        if not any(counts.values()):
+            lines.append("  (no recognisable log lines at all in this window)")
+
+    if device_ip:
+        loss, out = ping_device(device_ip)
+        if loss is None:
+            lines.append(f"\nPing {device_ip}: could not run ping — {out}")
+        else:
+            lines.append(f"\nPing {device_ip}: {loss} packet loss")
+
+    return "\n".join(lines)
+
+
 def stale_body(cfg, ts, age_hours):
+    diagnosis = diagnose_stale(cfg, int(age_hours) + 2)
     return f"""No fresh reading from the salt:detector.
 
   Last reading : {ts:%Y-%m-%d %H:%M:%S} ({age_hours:.1f} hours ago)
   Allowed age  : {cfg['alert']['max_reading_age_hours']} hours
 
-The salt level itself may be fine — this is about the monitoring. Worth
-checking:
+Automatic diagnosis:
+
+{diagnosis}
+
+The salt level itself may be fine — this is about the monitoring. If the
+above doesn't point at an obvious cause, worth checking manually:
 
   systemctl status salt-detector
   journalctl -u salt-detector -n 50
@@ -280,7 +432,8 @@ checking:
 
 If the device dropped off the network, its LED says where it is: flashing
 white means it lost its wifi credentials and needs re-pairing through the
-app over Bluetooth.
+app over Bluetooth. If it's reconnecting many times an hour, it may be
+bootlooping — see readme.md, "The provisioning reply: root cause found".
 
 -- salt-detector-alert
 """
@@ -296,10 +449,18 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="send regardless of threshold and cooldown")
     ap.add_argument("--status", action="store_true", help="print recent readings")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="run the stale-data diagnostics now, regardless of "
+                         "whether a reading is actually stale, and print the "
+                         "report without sending mail")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     a = cfg["alert"]
+
+    if args.diagnose:
+        print(diagnose_stale(cfg, int(a.get("max_reading_age_hours", 26))))
+        return 0
 
     if args.status:
         rows = recent_readings(cfg, 14)
